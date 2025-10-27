@@ -1,99 +1,334 @@
 #!/bin/bash
+#
+# === entrypoint ===
+#
+# 负责初始化 SFTP 服务，包括用户管理、SSH 密钥生成和启动 SSHD。
+# 遵循 Linus 的代码哲学：好品味、实用主义和简洁执念。
+#
+# -----------------------------------------------------------------------------
+
 set -Eeo pipefail
 
-# shellcheck disable=2154
-trap 's=$?; echo "$0: Error on line "$LINENO": $BASH_COMMAND"; exit $s' ERR
+# --- 错误处理 ---
+# 捕获脚本执行中的任何错误，并打印详细信息。
+# -----------------------------------------------------------------------------
+trap 's=$?; echo "$0: Error on line "$LINENO": "$BASH_COMMAND""; exit $s' ERR
 
-reArgsMaybe="^[^:[:space:]]+:.*$" # Smallest indication of attempt to use argument
-reArgSkip='^([[:blank:]]*#.*|[[:blank:]]*)$' # comment or empty line
-
-# Paths
-userConfPath="/etc/sftp/users.conf"
-userConfPathLegacy="/etc/sftp-users.conf"
-userConfFinalPath="/var/run/sftp/users.conf"
-
+# --- 日志函数 ---
+# 统一的日志输出函数，方便调试和跟踪。
+# -----------------------------------------------------------------------------
 function log() {
     echo "[$0] $*" >&2
 }
 
-# Allow running other programs, e.g. bash
+# --- 正则表达式定义 ---
+# 用于解析用户配置和跳过注释行。
+# -----------------------------------------------------------------------------
+reArgsMaybe="^[^:[:space:]]+:.*$" # 检查参数是否像用户配置 (username:password)
+reArgSkip='^([[:blank:]]*#.*|[[:blank:]]*)$' # 匹配注释行或空行
+
+# --- 路径定义 ---
+# 定义 SFTP 相关的配置文件和运行时路径。
+# -----------------------------------------------------------------------------
+USER_CONF_PATH="/etc/sftp/users.conf"
+USER_CONF_PATH_LEGACY="/etc/sftp-users.conf"
+USER_CONF_FINAL_PATH="/var/run/sftp/users.conf" # 最终合并的用户配置，每次启动时读取
+
+# 哥，这里是新的 chroot 根目录定义。
+# 管理用户的 chroot 目录是 /data。
+# 其他用户的 chroot 目录是 /data/<username>。
+# -----------------------------------------------------------------------------
+SFTP_BASE_DIR="/data" # 所有 SFTP 用户的 chroot 根目录的基路径
+
+# --- 动态识别 SFTP 管理用户 ---
+# 哥，这里是关键。我们从 users.conf 的第一行动态获取管理用户。
+# -----------------------------------------------------------------------------
+SFTP_MANAGER_USER=""
+# 兼容性处理: 遗留配置文件路径 (需要先处理，才能读取 USER_CONF_PATH)
+if [ ! -f "$USER_CONF_PATH" ] && [ -f "$USER_CONF_PATH_LEGACY" ]; then
+    mkdir -p "$(dirname "$USER_CONF_PATH")"
+    ln -s "$USER_CONF_PATH_LEGACY" "$USER_CONF_PATH"
+    log "已从遗留路径 $USER_CONF_PATH_LEGACY 链接到 $USER_CONF_PATH"
+fi
+
+if [ -f "$USER_CONF_PATH" ]; then
+    # 读取第一个非空非注释行
+    first_user_entry=$(grep -v -E "$reArgSkip" "$USER_CONF_PATH" | head -n 1)
+    if [ -n "$first_user_entry" ]; then
+        SFTP_MANAGER_USER=$(echo "$first_user_entry" | cut -d':' -f1)
+        log "动态识别 SFTP 管理用户为: $SFTP_MANAGER_USER (来自 $USER_CONF_PATH 的第一行)"
+    else
+        log "警告: $USER_CONF_PATH 文件为空或只包含注释，无法识别 SFTP 管理用户。"
+    fi
+else
+    log "警告: $USER_CONF_PATH 文件不存在，无法识别 SFTP 管理用户。请确保文件存在或通过其他方式提供用户。"
+fi
+
+# 如果没有从文件中识别到，可以考虑从环境变量或命令行参数中获取第一个用户作为管理用户
+# 但为了简化和遵循您的要求，目前只从文件中获取。
+# 如果 SFTP_MANAGER_USER 仍然为空，后续逻辑会依赖于此，可能需要更健壮的错误处理。
+# -----------------------------------------------------------------------------
+
+SFTP_MANAGER_CHROOT_DIR="${SFTP_BASE_DIR}" # 管理用户的 chroot 目录是 /data
+
+# --- 函数: 创建 SFTP 用户并设置 chroot 环境 ---
+#
+# 哥，这个函数是核心。它负责创建用户、设置密码、创建 chroot 目录，
+# 并根据用户类型（是否为 SFTP_MANAGER_USER）调整 chroot 路径和权限。
+# 遵循“函数短小，只做一件事”的原则，但这里为了封装用户创建的完整流程，
+# 稍微聚合了相关操作。内部逻辑已尽量扁平化。
+#
+# 参数:
+#   $1: 用户名:密码 字符串 (e.g., "username:password")
+#
+# -----------------------------------------------------------------------------
+function create_sftp_user_with_chroot() {
+    local user_pass_pair="$1"
+    local username=$(echo "$user_pass_pair" | cut -d':' -f1)
+    local password=$(echo "$user_pass_pair" | cut -d':' -f2-) # 密码可能包含冒号
+
+    log "正在处理用户: $username"
+
+    # --- 1. 确定用户的家目录 (即 chroot 目录) ---
+    # -------------------------------------------------------------------------
+    local user_chroot_dir=""
+    if [[ "$username" == "$SFTP_MANAGER_USER" ]]; then
+        user_chroot_dir="$SFTP_MANAGER_CHROOT_DIR" # 管理用户的 chroot 目录是 /data
+        log "用户 $username 是管理用户，其 chroot 目录设置为: $user_chroot_dir"
+    else
+        # 其他用户的 chroot 目录是 /data/<username>
+        user_chroot_dir="${SFTP_BASE_DIR}/${username}"
+        log "用户 $username 的 chroot 目录设置为: $user_chroot_dir"
+    fi
+
+    # --- 2. 创建用户和用户组 ---
+    # 确保 'users' 组存在。
+    # -------------------------------------------------------------------------
+    if ! getent group users > /dev/null; then
+        groupadd users
+        log "创建用户组: users"
+    fi
+
+    # 创建用户，并将其添加到 'users' 组。
+    # 使用 -d 明确指定家目录，这对于 sshd 的 ChrootDirectory %h 行为至关重要。
+    # 使用 -M 不创建默认家目录，因为我们手动管理。
+    # 使用 -s /sbin/nologin 禁用 shell 登录。
+    # -------------------------------------------------------------------------
+    if ! id -u "$username" > /dev/null 2>&1; then
+        useradd -M -g users -d "$user_chroot_dir" -s /sbin/nologin "$username"
+        log "创建用户: $username，家目录 (chroot 目录): $user_chroot_dir"
+    else
+        log "用户 $username 已存在，跳过创建。确保其家目录为 $user_chroot_dir。"
+        # 如果用户已存在，更新其家目录以匹配我们的 chroot 结构
+        usermod -d "$user_chroot_dir" "$username"
+    fi
+
+    # 设置用户密码。
+    # -------------------------------------------------------------------------
+    echo "$username:$password" | chpasswd
+    log "设置用户 $username 的密码。"
+
+    # --- 3. 设置 chroot 目录结构和权限 ---
+    #
+    # 哥，这里是 SFTP chroot 的核心权限要求：
+    # ChrootDirectory 指定的目录及其所有父目录，直到文件系统的根目录，
+    # 都必须由 root 拥有，且不能被其他用户或组写入。
+    # -------------------------------------------------------------------------
+
+    # 确保 /data 目录由 root 拥有，且权限严格。
+    # 这是所有用户 chroot 路径的共同父目录。
+    # -------------------------------------------------------------------------
+    mkdir -p "$SFTP_BASE_DIR"
+    chown root:root "$SFTP_BASE_DIR"
+    chmod 755 "$SFTP_BASE_DIR" # root 拥有，其他用户可读可执行
+    log "设置 SFTP 基目录 $SFTP_BASE_DIR 权限为 root:root 755。"
+
+    # 创建用户的实际 chroot 目录。
+    # **重要：这个目录本身必须由 root 拥有，且不能被其他用户或组写入。**
+    # -------------------------------------------------------------------------
+    mkdir -p "$user_chroot_dir"
+    chown root:root "$user_chroot_dir" # <--- 修改点1: chroot 目录本身由 root 拥有
+    chmod 755 "$user_chroot_dir"       # <--- 修改点2: chroot 目录权限为 755 (root可写，其他可读可执行)
+    log "设置用户 $username 的 chroot 目录 $user_chroot_dir 权限为 root:root 755。"
+
+    # 在 chroot 目录内部创建一个用户可写的子目录。
+    # 用户将在这个子目录中进行文件上传和管理。
+    # -------------------------------------------------------------------------
+    local user_writable_dir="${user_chroot_dir}/upload" # 默认创建 'upload' 目录
+    mkdir -p "$user_writable_dir"
+    chown "$username":users "$user_writable_dir"
+    chmod 775 "$user_writable_dir" # 用户和组可读写，其他用户只读
+    log "在用户 $username 的 chroot 目录 $user_chroot_dir 内创建可写子目录 $user_writable_dir，权限为 $username:users 775。"
+
+
+    # --- 4. 设置管理用户对其他用户 chroot 目录的读写权限 ---
+    # -------------------------------------------------------------------------
+    if [[ -n "$SFTP_MANAGER_USER" && "$username" != "$SFTP_MANAGER_USER" ]]; then
+        # 对于非管理用户，确保管理用户对其 chroot 目录的 *可写子目录* 有读写权限。
+        # 这里使用 ACL (Access Control List) 来实现，因为它比修改组权限更精确和安全。
+        # ---------------------------------------------------------------------
+        if command -v setfacl >/dev/null 2>&1; then
+            # 为管理用户设置对当前用户可写目录的 rwx 权限
+            setfacl -m u:"$SFTP_MANAGER_USER":rwx "$user_writable_dir"
+            setfacl -m d:u:"$SFTP_MANAGER_USER":rwx "$user_writable_dir" # 设置默认 ACL，新文件继承
+            log "为管理用户 $SFTP_MANAGER_USER 设置 ACL 权限到 $user_writable_dir。"
+        else
+            log "警告: setfacl 命令不可用。无法为管理用户 $SFTP_MANAGER_USER 设置精确的 ACL 权限。"
+            log "请考虑安装 acl 包 (e.g., apt-get install acl 或 yum install acl)。"
+            # 如果没有 ACL，备用方案是将管理用户也加入 users 组，
+            # 并将 chroot 目录的组权限设置为可写。但这会降低安全性。
+            # chown "$username":users "$user_chroot_dir"
+            # chmod 775 "$user_chroot_dir" # 组可写，管理用户也在 users 组
+        fi
+    fi
+
+    log "用户 $username 的 SFTP 环境设置完成。"
+}
+
+# --- 启动模式判断 ---
+# 判断是启动 SSHD 服务还是执行其他命令。
+# -----------------------------------------------------------------------------
+startSshd=false
 if [[ -z "$1" || "$1" =~ $reArgsMaybe ]]; then
     startSshd=true
-else
-    startSshd=false
 fi
 
-# Backward compatibility with legacy config path
-if [ ! -f "$userConfPath" ] && [ -f "$userConfPathLegacy" ]; then
-    mkdir -p "$(dirname $userConfPath)"
-    ln -s "$userConfPathLegacy" "$userConfPath"
+# --- SSH 主机密钥生成 (仅首次运行) ---
+# 哥，这个块现在独立于用户配置处理，只在密钥文件不存在时执行。
+# ---------------------------------------------------------------------
+if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
+    ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ''
+    log "生成 SSH 主机密钥: ed25519"
+fi
+if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
+    ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N ''
+    log "生成 SSH 主机密钥: rsa"
 fi
 
-# Create users only on first run
-if [ ! -f "$userConfFinalPath" ]; then
-    mkdir -p "$(dirname $userConfFinalPath)"
+# 限制 SSH 主机密钥的访问权限。
+# ---------------------------------------------------------------------
+chmod 600 /etc/ssh/ssh_host_ed25519_key || true
+chmod 600 /etc/ssh/ssh_host_rsa_key || true
+log "已设置 SSH 主机密钥权限为 600。"
 
-    if [ -f "$userConfPath" ]; then
-        # Append mounted config to final config
-        grep -v -E "$reArgSkip" < "$userConfPath" > "$userConfFinalPath"
-    fi
 
-    if $startSshd; then
-        # Append users from arguments to final config
-        for user in "$@"; do
-            echo "$user" >> "$userConfFinalPath"
-        done
-    fi
+# --- 用户配置处理 (每次启动时执行) ---
+# 哥，这个块现在在每次启动时都会重新生成 $USER_CONF_FINAL_PATH，
+# 确保它总是反映最新的用户配置。
+# -------------------------------------------------------------------------
+mkdir -p "$(dirname "$USER_CONF_FINAL_PATH")"
+log "正在重新生成用户配置到 $USER_CONF_FINAL_PATH (每次启动时更新)..."
 
-    if [ -n "$SFTP_USERS" ]; then
-        # Append users from environment variable to final config
-        IFS=" " read -r -a usersFromEnv <<< "$SFTP_USERS"
-        for user in "${usersFromEnv[@]}"; do
-            echo "$user" >> "$userConfFinalPath"
-        done
-    fi
+# 清空旧的最终用户配置文件
+> "$USER_CONF_FINAL_PATH"
 
-    # Check that we have users in config
-    if [ -f "$userConfFinalPath" ] && [ "$(wc -l < "$userConfFinalPath")" -gt 0 ]; then
-        # Import users from final conf file
-        while IFS= read -r user || [[ -n "$user" ]]; do
-            create-sftp-user "$user"
-        done < "$userConfFinalPath"
-    elif $startSshd; then
-        log "FATAL: No users provided!"
-        exit 3
-    fi
-
-    # Generate unique ssh keys for this container, if needed
-    if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
-        ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ''
-    fi
-    if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
-        ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N ''
-    fi
-
-    # Restrict access from other users
-    chmod 600 /etc/ssh/ssh_host_ed25519_key || true
-    chmod 600 /etc/ssh/ssh_host_rsa_key || true
+# 从挂载的配置文件中读取用户。
+# ---------------------------------------------------------------------
+if [ -f "$USER_CONF_PATH" ]; then
+    grep -v -E "$reArgSkip" < "$USER_CONF_PATH" >> "$USER_CONF_FINAL_PATH"
+    log "已从 $USER_CONF_PATH 加载用户到 $USER_CONF_FINAL_PATH。"
 fi
 
-# Source custom scripts, if any
+# 从命令行参数中读取用户 (如果启动 SSHD)。
+# ---------------------------------------------------------------------
+if $startSshd; then
+    for user_arg in "$@"; do
+        if [[ "$user_arg" =~ $reArgsMaybe ]]; then # 确保是用户配置格式
+            echo "$user_arg" >> "$USER_CONF_FINAL_PATH"
+            log "已从命令行参数加载用户: $(echo "$user_arg" | cut -d':' -f1) 到 $USER_CONF_FINAL_PATH。"
+        fi
+    done
+fi
+
+# 从环境变量 SFTP_USERS 中读取用户。
+# ---------------------------------------------------------------------
+if [ -n "$SFTP_USERS" ]; then
+    # 使用 IFS 避免空格问题，但仍需注意用户名或密码中包含空格的情况。
+    # 建议用户避免在用户名或密码中使用空格。
+    # -----------------------------------------------------------------
+    IFS=$'\n' read -r -d '' -a usersFromEnv < <(echo "$SFTP_USERS" | xargs -n1)
+    for user_env in "${usersFromEnv[@]}"; do
+        if [[ "$user_env" =~ $reArgsMaybe ]]; then # 确保是用户配置格式
+            echo "$user_env" >> "$USER_CONF_FINAL_PATH"
+            log "已从环境变量 SFTP_USERS 加载用户: $(echo "$user_env" | cut -d':' -f1) 到 $USER_CONF_FINAL_PATH。"
+        fi
+    done
+fi
+
+# --- 检查并创建用户 (每次启动时执行) ---
+# 哥，这个块现在在每次启动时都会执行，确保新增用户被创建。
+# -------------------------------------------------------------------------
+if [ -f "$USER_CONF_FINAL_PATH" ] && [ "$(wc -l < "$USER_CONF_FINAL_PATH")" -gt 0 ]; then
+    log "开始导入用户并设置 SFTP 环境 (每次启动时检查并更新)..."
+    while IFS= read -r user_entry || [[ -n "$user_entry" ]]; do
+        create_sftp_user_with_chroot "$user_entry"
+    done < "$USER_CONF_FINAL_PATH"
+elif $startSshd; then
+    log "FATAL: 未提供任何用户配置！请检查 $USER_CONF_PATH, 命令行参数或 SFTP_USERS 环境变量。"
+    exit 3
+fi
+
+# --- 执行自定义脚本 ---
+# 运行 /etc/sftp.d/ 目录下的所有可执行脚本。
+# -----------------------------------------------------------------------------
 if [ -d /etc/sftp.d ]; then
+    log "正在执行 /etc/sftp.d/ 下的自定义脚本..."
     for f in /etc/sftp.d/*; do
         if [ -x "$f" ]; then
-            log "Running $f ..."
-            $f
+            log "运行 $f ..."
+            "$f"
         else
-            log "Could not run $f, because it's missing execute permission (+x)."
+            log "无法运行 $f，因为它缺少执行权限 (+x)。"
         fi
     done
     unset f
 fi
 
+# --- 启动服务或执行命令 ---
+# 根据启动模式，启动 SSHD 或执行传入的命令。
+# -----------------------------------------------------------------------------
 if $startSshd; then
-    log "Executing sshd"
+    log "正在启动 SSHD 服务..."
+    # --- 动态生成 sshd_config ---
+    # 哥，这里是关键的优化。我们动态生成 sshd_config，
+    # 使用 Match Group users 和 ChrootDirectory %h。
+    # %h 会被替换为用户在 useradd 命令中设置的家目录，
+    # 从而实现每个用户有不同的 chroot 目录。
+    # -------------------------------------------------------------------------
+    cat <<EOF > /etc/ssh/sshd_config
+# 默认 SSHD 配置
+Port 22
+ListenAddress 0.0.0.0
+Protocol 2
+HostKey /etc/ssh/ssh_host_rsa_key
+HostKey /etc/ssh/ssh_host_ed25519_key
+SyslogFacility AUTHPRIV
+LogLevel INFO
+PermitRootLogin no
+ChallengeResponseAuthentication no
+PasswordAuthentication yes
+UsePAM yes
+X11Forwarding no
+PrintMotd no
+AcceptEnv LANG LC_*
+Subsystem sftp internal-sftp -u 002
+
+# 针对 SFTP 用户的 chroot 配置
+Match Group users
+    # ChrootDirectory %h 会将用户 chroot 到其家目录。
+    # 用户的家目录必须由 root 拥有，且不能被其他用户或组写入。
+    # 其所有父目录也必须满足此条件。
+    ChrootDirectory %h
+    ForceCommand internal-sftp
+    AllowTcpForwarding no
+    X11Forwarding no
+    PermitTunnel no
+    GatewayPorts no
+    AllowAgentForwarding no
+EOF
+    log "已更新 /etc/ssh/sshd_config，ChrootDirectory 设置为 %h (用户家目录)。"
     exec /usr/sbin/sshd -D -e
 else
-    log "Executing $*"
+    log "正在执行传入的命令: $*"
     exec "$@"
 fi
