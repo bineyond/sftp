@@ -1,8 +1,8 @@
 FROM alpine:latest
 
-LABEL maintainer="Bineyond <your-email@example.com>" \
-      org.opencontainers.image.title="SFTP Server (Alpine)" \
-      org.opencontainers.image.source="https://github.com/bineyond/sftp"
+LABEL maintainer="Bineyond <bineyond@gmail.com>" \
+    org.opencontainers.image.title="SFTP Server (Alpine)" \
+    org.opencontainers.image.source="https://github.com/bineyond/sftp"
 
 # Steps done in one RUN layer:
 # - Install upgrades and new packages

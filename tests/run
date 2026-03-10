@@ -148,6 +148,9 @@ function waitForServer() {
     for _ in {1..30}; do
         echo -n "."
         port="$(getSftpPort "$containerName")"
+        if [ "$OPTION_VERBOSE" == "$OPTION_TRUE" ]; then
+            echo " [DEBUG] Checking port: $port for $containerName"
+        fi
         if [ -n "$port" ] && ssh-keyscan -4 -T 1 -p "$port" "127.0.0.1" &>/dev/null; then
             echo " PORT $port OPEN"
             return 0;
@@ -165,24 +168,27 @@ function waitForServer() {
 
 function testSmallestUserConfig() {
     container run --name "$containerName" "${runArgs[@]}" \
+        -e SFTP_USERS="u:" \
         "$imageName" \
-        u: id u \
+        /bin/sh -c "id u" \
         > "$redirect" 2>&1
     assertTrue "user created" $?
 }
 
 function testCreateUserWithDot() {
     container run --name "$containerName" "${runArgs[@]}" \
+        -e SFTP_USERS="user.with.dot:" \
         "$imageName" \
-        user.with.dot: id user.with.dot \
+        /bin/sh -c "id user.with.dot" \
         > "$redirect" 2>&1
     assertTrue "user created" $?
 }
 
 function testUserCustomUidAndGid() {
     id="$(container run --name "$containerName" "${runArgs[@]}" \
+        -e SFTP_USERS="u::1234:4321:" \
         "$imageName" \
-        u::1234:4321: id u )"
+        /bin/sh -c "id u" )"
 
     echo "$id" | grep -q 'uid=1234('
     assertTrue "custom UID" $?
@@ -191,7 +197,7 @@ function testUserCustomUidAndGid() {
     assertTrue "custom GID" $?
 
     # Here we also check group name
-    assertEquals "uid=1234(u) gid=4321(group_4321) groups=4321(group_4321)" "$id"
+    assertEquals "uid=1234(u) gid=4321(group_4321) groups=4321(group_4321),100(users)" "$id"
 }
 
 function testCommandPassthrough() {

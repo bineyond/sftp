@@ -91,29 +91,30 @@ function create_sftp_user_with_chroot() {
     local entry="$1"
     log "正在解析用户信息: \"$entry\""
 
-    # 使用数组解析冒号分隔的参数
-    IFS=':' read -ra args <<< "$entry"
+    # 使用正则表达式解析
+    local reArgs="^(${reUser})(:${rePass})?(:e)?(:${reUid})?(:${reGid})?(:${reDir})?$"
     
-    local username="${args[0]}"
-    local password="${args[1]}"
-    local chpasswd_opts=""
-    local skip_idx=0
-
-    # 验证用户名
-    if [[ ! "$username" =~ ^$reUser$ ]]; then
-        log "错误: 无效的用户名 \"$username\""
+    if [[ ! "$entry" =~ $reArgs ]]; then
+        log "错误: 用户配置格式无效 \"$entry\""
         return 1
     fi
 
-    # 检查是否为加密密码 (标志位 'e')
-    if [ "${args[2]}" == "e" ]; then
+    local username="${BASH_REMATCH[1]}"
+    local password="${BASH_REMATCH[2]:1}"
+    local encryption="${BASH_REMATCH[3]:1}"
+    local uid="${BASH_REMATCH[4]:1}"
+    local gid="${BASH_REMATCH[5]:1}"
+    local dirs="${BASH_REMATCH[6]:1}"
+
+    if [ "$encryption" == "e" ]; then
         chpasswd_opts="-e"
-        skip_idx=1
     fi
 
-    local uid="${args[$((skip_idx+2))]}"
-    local gid="${args[$((skip_idx+3))]}"
-    local dirs="${args[$((skip_idx+4))]}"
+    # 确保 'users' 组总是存在，因为 sshd_config 依赖它进行 Match Group users
+    if ! getent group users > /dev/null; then
+        groupadd users
+        log "创建默认 SFTP 组: users"
+    fi
 
     log "正在处理用户: $username"
 
@@ -137,17 +138,21 @@ function create_sftp_user_with_chroot() {
         useradd_opts+=(--non-unique --uid "$uid")
     fi
 
+    # 确保 'users' 组总是存在，因为 sshd_config 依赖它进行 Match
+    if ! getent group users > /dev/null; then
+        groupadd users
+        log "创建默认 SFTP 组: users"
+    fi
+
     if [ -n "$gid" ]; then
         if ! getent group "$gid" > /dev/null; then
             groupadd --gid "$gid" "group_$gid"
-            log "创建用户组: group_$gid (GID: $gid)"
+            log "创建自定义用户组: group_$gid (GID: $gid)"
         fi
-        useradd_opts+=(--gid "$gid")
+        # 设置自定义组为主要组，并加入 'users' 附加组
+        useradd_opts+=(--gid "$gid" --groups users)
     else
-        # 默认使用 users 组
-        if ! getent group users > /dev/null; then
-            groupadd users
-        fi
+        # 默认使用 users 组作为主要组
         useradd_opts+=(--gid users)
     fi
 
@@ -157,7 +162,12 @@ function create_sftp_user_with_chroot() {
     else
         log "用户 $username 已存在，更新设置。"
         usermod -d "$user_chroot_dir" "$username"
-        if [ -n "$gid" ]; then usermod -g "$gid" "$username"; fi
+        if [ -n "$gid" ]; then 
+            usermod -g "$gid" "$username"
+            usermod -a -G users "$username"
+        else
+            usermod -g users "$username"
+        fi
     fi
 
     # 设置密码
@@ -169,8 +179,9 @@ function create_sftp_user_with_chroot() {
         log "用户 $username 未通过参数设置密码。"
     fi
     
-    # 记录真实 UID，用于权限设置
+    # 记录真实 UID 和 GID，用于权限设置
     local real_uid=$(id -u "$username")
+    local real_gid=$(id -g "$username")
 
     # --- 3. 设置 chroot 目录结构和权限 ---
     # -------------------------------------------------------------------------
@@ -228,7 +239,7 @@ function create_sftp_user_with_chroot() {
             
             # 设置权限：SSHD 要求 AuthorizedKeysFile 及其父目录权限严格
             # 如果是只读挂载且权限不正确，SSHD 可能会拒绝，但我们也没法改
-            chown -R root:root "$user_keys_base_dir" || true
+            chown -R "$real_uid:$real_gid" "$user_keys_base_dir" || true
             chmod 755 "$user_keys_base_dir" || true
             chmod 644 "$authorized_keys_file" || true
             log "用户 $username 的 SSH 密钥配置尝试完成：$authorized_keys_file"
@@ -272,29 +283,36 @@ function create_sftp_user_with_chroot() {
 
 # --- 启动模式判断 ---
 # 判断是启动 SSHD 服务还是执行其他命令。
+# 逻辑：
+# 1. 如果没有参数，默认启动 SSHD。
+# 2. 如果第一个参数符合用户配置格式 (user:pass...)，则视为启动 SSHD。
+# 3. 否则，视为执行传入的命令。
 # -----------------------------------------------------------------------------
 startSshd=false
 if [[ -z "$1" || "$1" =~ $reArgsMaybe ]]; then
     startSshd=true
+    log "检测到命令行参数包含用户配置或参数为空，将启动 SSHD 服务。"
+else
+    log "检测到命令行参数不符合用户配置格式，将执行自定义命令。"
 fi
 
 # --- SSH 主机密钥生成 (仅首次运行) ---
 # 哥，这个块现在独立于用户配置处理，只在密钥文件不存在时执行。
 # ---------------------------------------------------------------------
 if [ ! -f /etc/ssh/ssh_host_ed25519_key ]; then
-    ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N ''
+    ssh-keygen -q -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N '' || log "警告: ed25519 密钥生成失败"
     log "生成 SSH 主机密钥: ed25519"
 fi
 if [ ! -f /etc/ssh/ssh_host_rsa_key ]; then
-    ssh-keygen -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N ''
+    ssh-keygen -q -t rsa -b 4096 -f /etc/ssh/ssh_host_rsa_key -N '' || log "警告: rsa 密钥生成失败"
     log "生成 SSH 主机密钥: rsa"
 fi
 
 # 限制 SSH 主机密钥的访问权限。
 # ---------------------------------------------------------------------
-chmod 600 /etc/ssh/ssh_host_ed25519_key || true
-chmod 600 /etc/ssh/ssh_host_rsa_key || true
-log "已设置 SSH 主机密钥权限为 600。"
+chmod 600 /etc/ssh/ssh_host_ed25519_key 2>/dev/null || true
+chmod 600 /etc/ssh/ssh_host_rsa_key 2>/dev/null || true
+log "已设置 SSH 主机密钥权限。"
 
 
 # --- 用户配置处理 (每次启动时执行) ---
@@ -328,11 +346,9 @@ fi
 # 从环境变量 SFTP_USERS 中读取用户。
 # ---------------------------------------------------------------------
 if [ -n "$SFTP_USERS" ]; then
-    # 使用 IFS 避免空格问题，但仍需注意用户名或密码中包含空格的情况。
-    # 建议用户避免在用户名或密码中使用空格。
-    # -----------------------------------------------------------------
-    IFS=$'\n' read -r -d '' -a usersFromEnv < <(echo "$SFTP_USERS" | xargs -n1)
-    for user_env in "${usersFromEnv[@]}"; do
+    log "正在从环境变量 SFTP_USERS 解析用户配置..."
+    # 使用 for 循环逐个处理由 xargs 分割的用户配置
+    for user_env in $(echo "$SFTP_USERS" | xargs -n1); do
         if [[ "$user_env" =~ $reArgsMaybe ]]; then # 确保是用户配置格式
             echo "$user_env" >> "$USER_CONF_FINAL_PATH"
             log "已从环境变量 SFTP_USERS 加载用户: $(echo "$user_env" | cut -d':' -f1) 到 $USER_CONF_FINAL_PATH。"
@@ -348,9 +364,12 @@ if [ -f "$USER_CONF_FINAL_PATH" ] && [ "$(wc -l < "$USER_CONF_FINAL_PATH")" -gt 
     while IFS= read -r user_entry || [[ -n "$user_entry" ]]; do
         create_sftp_user_with_chroot "$user_entry"
     done < "$USER_CONF_FINAL_PATH"
-elif $startSshd; then
-    log "FATAL: 未提供任何用户配置！请检查 $USER_CONF_PATH, 命令行参数或 SFTP_USERS 环境变量。"
-    exit 3
+else
+    if $startSshd; then
+        log "警告: 未提供任何用户配置！SSHD 可能无法正常工作，除非您挂载了自定义配置。"
+    else
+        log "提示: 未检测到用户配置，将直接执行传入的命令。"
+    fi
 fi
 
 # --- 执行自定义脚本 ---
@@ -379,6 +398,7 @@ if $startSshd; then
     # 使用 Match Group users 和 ChrootDirectory %h。
     # %h 会被替换为用户在 useradd 命令中设置的家目录，
     # 从而实现每个用户有不同的 chroot 目录。
+    # -------------------------------------------------------------------------
     # -------------------------------------------------------------------------
     cat <<EOF > /etc/ssh/sshd_config
 # 默认 SSHD 配置
@@ -412,6 +432,10 @@ Subsystem sftp internal-sftp -u 002
     GatewayPorts no
     AllowAgentForwarding no
 EOF
+    if [ "$OPTION_VERBOSE" == "true" ] || [ "$DEBUG" == "1" ]; then
+        log "生成的 /etc/ssh/sshd_config 内容如下："
+        cat /etc/ssh/sshd_config >&2
+    fi
     log "已更新 /etc/ssh/sshd_config，ChrootDirectory 设置为 %h (用户家目录)。"
     exec /usr/sbin/sshd -D -e
 else

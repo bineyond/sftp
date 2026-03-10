@@ -92,12 +92,17 @@ docker run \
 `docker run --rm python:alpine python -c "import crypt; print(crypt.crypt('YOUR_PASSWORD'))"`
 
 ```bash
-docker run -p 22:22 -d bineyond/sftp 'foo:$6$xyz...:e:1001'
+docker run \
+    -v <host-dir>/share:/data/foo/share \
+    -p 2222:22 -d bineyond/sftp \
+    'foo:$1$0G2g0GSt$ewU0t6GXG15.0hWoOX8X9.:e:1001'
 ```
 
 ## 5. SSH 密钥登录 (免密登录 - 推荐)
 
-将公钥挂载到容器的 `/etc/sftp/keys/<username>/` 目录下。该目录下的所有 `.pub` 文件将自动合并。
+将公钥挂载到容器的 `/etc/sftp/keys/<username>/` 目录下。该目录下的所有 `.pub` 文件将自动合并到 `authorized_keys` 中。
+
+在这个示例中，我们**不提供密码**，因此用户 `foo` 只能通过其 SSH 密钥登录。
 
 ```bash
 docker run \
@@ -123,6 +128,9 @@ docker run \
 ```
 
 提示：使用 `ssh-keygen -t ed25519 -f ssh_host_ed25519_key < /dev/null` 生成密钥。
+或
+提示：使用 `ssh-keygen -t rsa -b 4096 -f ssh_host_rsa_key < /dev/null` 生成密钥。
+
 
 # 高级自定义
 

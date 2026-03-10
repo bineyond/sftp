@@ -1,6 +1,6 @@
 FROM debian:bookworm
 
-LABEL maintainer="Bineyond <your-email@example.com>" \
+LABEL maintainer="Bineyond <bineyond@gmail.com>" \
     org.opencontainers.image.title="SFTP Server" \
     org.opencontainers.image.description="基于 OpenSSH 的 SFTP 服务容器，支持免密登录、高级用户配置及中文日志。" \
     org.opencontainers.image.source="https://github.com/bineyond/sftp"
