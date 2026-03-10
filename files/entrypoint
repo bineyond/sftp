@@ -268,9 +268,9 @@ function create_sftp_user_with_chroot() {
 
             for td in "${target_dirs[@]}"; do
                 if [ -d "$td" ]; then
-                    setfacl -m u:"$SFTP_MANAGER_USER":rwx "$td"
-                    setfacl -m d:u:"$SFTP_MANAGER_USER":rwx "$td"
-                    log "为管理用户 $SFTP_MANAGER_USER 设置 ACL 权限到 $td。"
+                    setfacl -m u:"$SFTP_MANAGER_USER":rwx "$td" 2>/dev/null || log "警告: $td 文件系统不支持设置 ACL 权限，管理用户可能无法充分控制此目录。"
+                    setfacl -m d:u:"$SFTP_MANAGER_USER":rwx "$td" 2>/dev/null || true
+                    log "为管理用户 $SFTP_MANAGER_USER 尝试设置 ACL 权限到 $td。"
                 fi
             done
         else
