@@ -9,7 +9,7 @@ LABEL maintainer="Bineyond <bineyond@gmail.com>" \
 # - OpenSSH needs /var/run/sshd to run
 # - Remove generic host keys, entrypoint generates unique keys
 RUN apk update && apk upgrade && \
-    apk add --no-cache bash shadow openssh-server-pam openssh-sftp-server && \
+    apk add --no-cache bash shadow openssh-server-pam openssh-sftp-server acl && \
     rm -rf /var/cache/apk/* && \
     ln -s /usr/sbin/sshd.pam /usr/sbin/sshd && \
     mkdir -p /var/run/sshd && \
