@@ -1,83 +1,78 @@
-# SFTP
+# SFTP 服务容器
 
 ![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/atmoz/sftp/build.yml?logo=github) ![GitHub stars](https://img.shields.io/github/stars/atmoz/sftp?logo=github) ![Docker Stars](https://img.shields.io/docker/stars/atmoz/sftp?label=stars&logo=docker) ![Docker Pulls](https://img.shields.io/docker/pulls/atmoz/sftp?label=pulls&logo=docker)
 
 ![OpenSSH logo](https://raw.githubusercontent.com/atmoz/sftp/master/openssh.png "Powered by OpenSSH")
 
-# Supported tags and respective `Dockerfile` links
+# 支持的标签和 `Dockerfile` 链接
 
 - [`debian`, `latest` (*Dockerfile*)](https://github.com/atmoz/sftp/blob/master/Dockerfile) ![Docker Image Size (debian)](https://img.shields.io/docker/image-size/atmoz/sftp/debian?label=debian&logo=debian&style=plastic)
 - [`alpine` (*Dockerfile*)](https://github.com/atmoz/sftp/blob/master/Dockerfile-alpine) ![Docker Image Size (alpine)](https://img.shields.io/docker/image-size/atmoz/sftp/alpine?label=alpine&logo=Alpine%20Linux&style=plastic)
 
-# Securely share your files
+# 安全地共享您的文件
 
-Easy to use SFTP ([SSH File Transfer Protocol](https://en.wikipedia.org/wiki/SSH_File_Transfer_Protocol)) server with [OpenSSH](https://en.wikipedia.org/wiki/OpenSSH).
+使用 [OpenSSH](https://en.wikipedia.org/wiki/OpenSSH) 提供简单易用的 SFTP ([SSH File Transfer Protocol](https://en.wikipedia.org/wiki/SSH_File_Transfer_Protocol)) 服务器。
 
-# Usage
+# 使用方法
 
-- Define users in (1) command arguments, (2) `SFTP_USERS` environment variable
-  or (3) in file mounted as `/etc/sftp/users.conf` (syntax:
-  `user:pass[:e][:uid[:gid[:dir1[,dir2]...]]] ...`, see below for examples)
-  - Set UID/GID manually for your users if you want them to make changes to
-    your mounted volumes with permissions matching your host filesystem.
-  - Directory names at the end will be created under user's home directory with
-    write permission, if they aren't already present.
-- Mount volumes
-  - The users are chrooted to their home directory, so you can mount the
-    volumes in separate directories inside the user's home directory
-    (/home/user/**mounted-directory**) or just mount the whole **/home** directory.
-    Just remember that the users can't create new files directly under their
-    own home directory, so make sure there are at least one subdirectory if you
-    want them to upload files.
-  - For consistent server fingerprint, mount your own host keys (i.e. `/etc/ssh/ssh_host_*`)
+- **定义用户**：可以通过以下三种方式定义用户：
+  1. 命令行参数
+  2. `SFTP_USERS` 环境变量
+  3. 挂载到 `/etc/sftp/users.conf` 的文件（语法：`user:pass[:e][:uid[:gid[:dir1[,dir2]...]]]`，详见下文示例）
+  - 如果需要用户对挂载卷的修改权限与宿主机文件系统权限匹配，请手动设置 UID/GID。
+  - 末尾目录名将在用户的家目录下创建，并赋予写权限（如果不存在）。
+- **挂载卷**：
+  - 用户被限制（chroot）在他们的家目录中，因此您可以将卷挂载到用户家目录内的单独目录（`/data/user/已挂载目录`），或者直接挂载整个 `/data` 目录。
+  - 请记住，用户无法直接在自己的家目录下创建新文件，因此请确保至少有一个子目录（如 `upload`）以便他们上传文件。
+  - 为了保持服务器指纹一致，请挂载您自己的主机密钥（即 `/etc/ssh/ssh_host_*`）。
 
-# Examples
+# 示例
 
-## Simplest docker run example
+## 最简单的 Docker 运行示例
 
-```
+```bash
 docker run -p 22:22 -d atmoz/sftp foo:pass:::upload
 ```
 
-User "foo" with password "pass" can login with sftp and upload files to a folder called "upload". No mounted directories or custom UID/GID. Later you can inspect the files and use `--volumes-from` to mount them somewhere else (or see next example).
+用户 "foo" 使用密码 "pass" 登录 sftp，并可以上传文件到名为 "upload" 的文件夹。无需挂载目录或自定义 UID/GID。
 
-## Sharing a directory from your computer
+## 共享计算机上的目录
 
-Let's mount a directory and set UID:
+挂载目录并设置 UID：
 
-```
+```bash
 docker run \
-    -v <host-dir>/upload:/home/foo/upload \
+    -v <host-dir>/upload:/data/foo/upload \
     -p 2222:22 -d atmoz/sftp \
     foo:pass:1001
 ```
 
-### Using Docker Compose:
+### 使用 Docker Compose：
 
-```
+```yaml
 sftp:
     image: atmoz/sftp
     volumes:
-        - <host-dir>/upload:/home/foo/upload
+        - <host-dir>/upload:/data/foo/upload
     ports:
         - "2222:22"
     command: foo:pass:1001
 ```
 
-### Logging in
+### 登录
 
-The OpenSSH server runs by default on port 22, and in this example, we are forwarding the container's port 22 to the host's port 2222. To log in with the OpenSSH client, run: `sftp -P 2222 foo@<host-ip>`
+OpenSSH 服务器默认运行在 22 端口，在此示例中，我们将容器的 22 端口转发到主机的 2222 端口。使用 OpenSSH 客户端登录：`sftp -P 2222 foo@<host-ip>`
 
-## Store users in config
+## 将用户存储在配置中
 
-```
+```bash
 docker run \
     -v <host-dir>/users.conf:/etc/sftp/users.conf:ro \
-    -v mySftpVolume:/home \
+    -v mySftpVolume:/data \
     -p 2222:22 -d atmoz/sftp
 ```
 
-<host-dir>/users.conf:
+`<host-dir>/users.conf`:
 
 ```
 foo:123:1001:100
@@ -85,96 +80,87 @@ bar:abc:1002:100
 baz:xyz:1003:100
 ```
 
-## Encrypted password
+## 加密密码
 
-Add `:e` behind password to mark it as encrypted. Use single quotes if using terminal.
+在密码后添加 `:e` 标记其为加密密码。如果在终端中使用，请使用单引号。
 
-```
+```bash
 docker run \
-    -v <host-dir>/share:/home/foo/share \
+    -v <host-dir>/share:/data/foo/share \
     -p 2222:22 -d atmoz/sftp \
     'foo:$1$0G2g0GSt$ewU0t6GXG15.0hWoOX8X9.:e:1001'
 ```
 
-Tip: you can use this Python code to generate encrypted passwords:  
+提示：您可以使用此 Python 代码生成加密密码：  
 `docker run --rm python:alpine python -c "import crypt; print(crypt.crypt('YOUR_PASSWORD'))"`
 
-## Logging in with SSH keys
+## 使用 SSH 密钥登录（免密登录）
 
-Mount public keys in the user's `.ssh/keys/` directory. All keys are automatically appended to `.ssh/authorized_keys` (you can't mount this file directly, because OpenSSH requires limited file permissions). In this example, we do not provide any password, so the user `foo` can only login with his SSH key.
+将公钥挂载到容器的 `/etc/sftp/keys/<username>/` 目录下。该目录下的所有 `.pub` 文件将自动合并到 `authorized_keys` 中。
 
-```
+在这个示例中，我们**不提供密码**，因此用户 `foo` 只能通过其 SSH 密钥登录。
+
+```bash
 docker run \
-    -v <host-dir>/id_rsa.pub:/home/foo/.ssh/keys/id_rsa.pub:ro \
-    -v <host-dir>/id_other.pub:/home/foo/.ssh/keys/id_other.pub:ro \
-    -v <host-dir>/share:/home/foo/share \
+    -v <host-dir>/id_rsa.pub:/etc/sftp/keys/foo/id_rsa.pub:ro \
+    -v <host-dir>/share:/data/foo/share \
     -p 2222:22 -d atmoz/sftp \
     foo::1001
 ```
 
-## Providing your own SSH host key (recommended)
+**优点**：
+- **安全性**：`authorized_keys` 存储在 chroot 目录之外，用户登录后不可见且不可修改其认证配置。
+- **强制密钥认证**：通过不设置密码（`user::`），可以强制用户必须使用密钥登录。
 
-This container will generate new SSH host keys at first run. To avoid that your users get a MITM warning when you recreate your container (and the host keys changes), you can mount your own host keys.
+## 提供您自己的 SSH 主机密钥（推荐）
 
-```
+此容器在首次运行时会生成新的 SSH 主机密钥。为了避免用户在您重新创建容器（主机密钥改变）时收到 MITM 警告，您可以挂载自己的主机密钥。
+
+```bash
 docker run \
     -v <host-dir>/ssh_host_ed25519_key:/etc/ssh/ssh_host_ed25519_key \
     -v <host-dir>/ssh_host_rsa_key:/etc/ssh/ssh_host_rsa_key \
-    -v <host-dir>/share:/home/foo/share \
+    -v <host-dir>/share:/data/foo/share \
     -p 2222:22 -d atmoz/sftp \
     foo::1001
 ```
 
-Tip: you can generate your keys with these commands:
+提示：您可以使用以下命令生成密钥：
 
-```
+```bash
 ssh-keygen -t ed25519 -f ssh_host_ed25519_key < /dev/null
 ssh-keygen -t rsa -b 4096 -f ssh_host_rsa_key < /dev/null
 ```
 
-## Execute custom scripts or applications
+## 执行自定义脚本或应用
 
-Put your programs in `/etc/sftp.d/` and it will automatically run when the container starts.
-See next section for an example.
+将您的程序放在 `/etc/sftp.d/` 下，它们将在容器启动时自动运行。
 
-## Bindmount dirs from another location
+## 绑定挂载其他位置的目录
 
-If you are using `--volumes-from` or just want to make a custom directory available in user's home directory, you can add a script to `/etc/sftp.d/` that bindmounts after container starts.
+如果您想让用户访问特定的目录，可以在 `/etc/sftp.d/` 中添加一个脚本，在容器启动后进行 `mount --bind`。
 
-```
+```bash
 #!/bin/bash
-# File mounted as: /etc/sftp.d/bindmount.sh
-# Just an example (make your own)
+# 文件挂载为: /etc/sftp.d/bindmount.sh
 
 function bindmount() {
     if [ -d "$1" ]; then
         mkdir -p "$2"
     fi
-    mount --bind $3 "$1" "$2"
+    mount --bind "$1" "$2"
 }
 
-# Remember permissions, you may have to fix them:
-# chown -R :users /data/common
-
-bindmount /data/admin-tools /home/admin/tools
-bindmount /data/common /home/dave/common
-bindmount /data/common /home/peter/common
-bindmount /data/docs /home/peter/docs --read-only
+# 挂载示例
+bindmount /data/common /data/foo/common
 ```
 
-**NOTE:** Using `mount` requires that your container runs with the `CAP_SYS_ADMIN` capability turned on. [See this answer for more information](https://github.com/atmoz/sftp/issues/60#issuecomment-332909232).
+**注意**：使用 `mount` 需要容器运行时开启 `CAP_SYS_ADMIN` 权限。
 
-# What's the difference between Debian and Alpine?
+# Debian 和 Alpine 有什么区别？
 
-The biggest differences are in size and OpenSSH version. [Alpine](https://hub.docker.com/_/alpine/) is 10 times smaller than [Debian](https://hub.docker.com/_/debian/). OpenSSH version can also differ, as it's two different teams maintaining the packages. Debian is generally considered more stable and only bugfixes and security fixes are added after each Debian release (about 2 years). Alpine has a faster release cycle (about 6 months) and therefore newer versions of OpenSSH. As I'm writing this, Debian has version 7.4 while Alpine has version 7.5. Recommended reading: [Comparing Debian vs Alpine for container & Docker apps](https://www.turnkeylinux.org/blog/alpine-vs-debian)
+主要区别在于大小和 OpenSSH 版本。Alpine 比 Debian 小 10 倍左右。Debian 通常被认为更稳定，而 Alpine 更新周期更快。
 
-# What version of OpenSSH do I get?
+# 每日构建
 
-It depends on which linux distro and version you choose (see available images at the top). You can see what version you get by checking the distro's packages online. I have provided direct links below for easy access.
-
-- [List of `openssh` packages on Alpine releases](https://pkgs.alpinelinux.org/packages?name=openssh&branch=&repo=main&arch=x86_64)
-- [List of `openssh-server` packages on Debian releases](https://packages.debian.org/search?keywords=openssh-server&searchon=names&exact=1&suite=all&section=main)
-
-# Daily builds
-
-Images are automatically built daily to get the newest version of OpenSSH provided by the package managers.
+镜像每天自动构建，以获取包管理器提供的最新 OpenSSH 版本。

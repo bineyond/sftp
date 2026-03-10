@@ -123,10 +123,15 @@ function create_sftp_user_with_chroot() {
         usermod -d "$user_chroot_dir" "$username"
     fi
 
-    # 设置用户密码。
+    # 设置用户密码。如果未提供密码，则禁用密码登录（支持密钥登录）。
     # -------------------------------------------------------------------------
-    echo "$username:$password" | chpasswd
-    log "设置用户 $username 的密码。"
+    if [ -n "$password" ]; then
+        echo "$username:$password" | chpasswd
+        log "设置用户 $username 的密码。"
+    else
+        usermod -p "*" "$username"
+        log "用户 $username 未提供密码，已禁用密码登录（仅支持密钥登录）。"
+    fi
 
     # --- 3. 设置 chroot 目录结构和权限 ---
     #
@@ -161,7 +166,44 @@ function create_sftp_user_with_chroot() {
     log "在用户 $username 的 chroot 目录 $user_chroot_dir 内创建可写子目录 $user_writable_dir，权限为 $username:users 775。"
 
 
-    # --- 4. 设置管理用户对其他用户 chroot 目录的读写权限 ---
+    # --- 4. 设置 SSH 密钥 (免密登录支持) ---
+    # 密钥存放在 chroot 目录之外：/etc/sftp/keys/${username}/
+    # 这样做更安全，用户无法通过 SFTP 看到或修改自己的 authorized_keys。
+    # -------------------------------------------------------------------------
+    local user_keys_base_dir="/etc/sftp/keys/${username}"
+    local authorized_keys_file="${user_keys_base_dir}/authorized_keys"
+
+    # 检查是否有公钥输入目录 (传统方式是从 .ssh/keys 挂载，这里我们也支持从外部挂载到 user_keys_base_dir)
+    # 逻辑：如果 /etc/sftp/keys/${username}/ 下有任何 .pub 文件，或者该目录已存在。
+    if [ -d "$user_keys_base_dir" ]; then
+        log "正在配置用户 $username 的免密登录 (存储位置: $user_keys_base_dir)..."
+        
+        # 临时文件用于合并和去重
+        local tmp_keys_file=$(mktemp)
+        
+        # 兼容旧路径逻辑：如果用户尝试挂载到 chroot 里的 .ssh/keys，我们尝试迁移或报错
+        # 但既然用户要求放在外面，我们就只看外部目录
+        find "$user_keys_base_dir" -maxdepth 1 -name "*.pub" -exec cat {} + >> "$tmp_keys_file"
+
+        if [ -s "$tmp_keys_file" ]; then
+            # 去重并写入 authorized_keys
+            # 如果目录是只读挂载，这里可能会失败，但在那种情况下用户应该已经把 authorized_keys 准备好了
+            sort < "$tmp_keys_file" | uniq > "$authorized_keys_file" || true
+            
+            # 设置权限：SSHD 要求 AuthorizedKeysFile 及其父目录权限严格
+            # 如果是只读挂载且权限不正确，SSHD 可能会拒绝，但我们也没法改
+            chown -R root:root "$user_keys_base_dir" || true
+            chmod 755 "$user_keys_base_dir" || true
+            chmod 644 "$authorized_keys_file" || true
+            log "用户 $username 的 SSH 密钥配置尝试完成：$authorized_keys_file"
+        else
+            log "提示: $user_keys_base_dir 目录下未找到 .pub 文件，跳过生成 authorized_keys。"
+        fi
+        rm "$tmp_keys_file"
+    fi
+
+
+    # --- 5. 设置管理用户对其他用户 chroot 目录的读写权限 ---
     # -------------------------------------------------------------------------
     if [[ -n "$SFTP_MANAGER_USER" && "$username" != "$SFTP_MANAGER_USER" ]]; then
         # 对于非管理用户，确保管理用户对其 chroot 目录的 *可写子目录* 有读写权限。
@@ -313,13 +355,14 @@ PrintMotd no
 AcceptEnv LANG LC_*
 Subsystem sftp internal-sftp -u 002
 
-# 针对 SFTP 用户的 chroot 配置
-Match Group users
-    # ChrootDirectory %h 会将用户 chroot 到其家目录。
-    # 用户的家目录必须由 root 拥有，且不能被其他用户或组写入。
-    # 其所有父目录也必须满足此条件。
-    ChrootDirectory %h
-    ForceCommand internal-sftp
+    # 针对 SFTP 用户的 chroot 配置
+    Match Group users
+        # ChrootDirectory %h 会将用户 chroot 到其家目录。
+        # 用户的家目录必须由 root 拥有，且不能被其他用户或组写入。
+        # 其所有父目录也必须满足此条件。
+        ChrootDirectory %h
+        AuthorizedKeysFile /etc/sftp/keys/%u/authorized_keys
+        ForceCommand internal-sftp
     AllowTcpForwarding no
     X11Forwarding no
     PermitTunnel no
