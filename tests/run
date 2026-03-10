@@ -165,27 +165,24 @@ function waitForServer() {
 
 function testSmallestUserConfig() {
     container run --name "$containerName" "${runArgs[@]}" \
-        --entrypoint="/bin/sh" \
         "$imageName" \
-        -c "create-sftp-user u: && id u" \
+        u: id u \
         > "$redirect" 2>&1
     assertTrue "user created" $?
 }
 
 function testCreateUserWithDot() {
     container run --name "$containerName" "${runArgs[@]}" \
-        --entrypoint="/bin/sh" \
         "$imageName" \
-        -c "create-sftp-user user.with.dot: && id user.with.dot" \
+        user.with.dot: id user.with.dot \
         > "$redirect" 2>&1
     assertTrue "user created" $?
 }
 
 function testUserCustomUidAndGid() {
     id="$(container run --name "$containerName" "${runArgs[@]}" \
-        --entrypoint="/bin/sh" \
         "$imageName" \
-        -c "create-sftp-user u::1234:4321: > /dev/null && id u" )"
+        u::1234:4321: id u )"
 
     echo "$id" | grep -q 'uid=1234('
     assertTrue "custom UID" $?

@@ -1,5 +1,9 @@
 FROM debian:bookworm
-MAINTAINER Adrian Dvergsdal [atmoz.net]
+
+LABEL maintainer="Bineyond <your-email@example.com>" \
+    org.opencontainers.image.title="SFTP Server" \
+    org.opencontainers.image.description="基于 OpenSSH 的 SFTP 服务容器，支持免密登录、高级用户配置及中文日志。" \
+    org.opencontainers.image.source="https://github.com/bineyond/sftp"
 
 # Steps done in one RUN layer:
 # - Install upgrades and new packages
@@ -13,7 +17,6 @@ RUN apt-get update && \
     rm -f /etc/ssh/ssh_host_*key*
 
 COPY files/sshd_config /etc/ssh/sshd_config
-COPY files/create-sftp-user /usr/local/bin/
 COPY files/entrypoint /
 
 EXPOSE 22

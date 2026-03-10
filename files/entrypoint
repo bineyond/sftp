@@ -24,6 +24,11 @@ function log() {
 # --- 正则表达式定义 ---
 # 用于解析用户配置和跳过注释行。
 # -----------------------------------------------------------------------------
+reUser='[A-Za-z0-9._][A-Za-z0-9._-]{0,31}' # POSIX.1-2008
+rePass='[^:]{0,255}'
+reUid='[[:digit:]]*'
+reGid='[[:digit:]]*'
+reDir='[^:]*'
 reArgsMaybe="^[^:[:space:]]+:.*$" # 检查参数是否像用户配置 (username:password)
 reArgSkip='^([[:blank:]]*#.*|[[:blank:]]*)$' # 匹配注释行或空行
 
@@ -79,13 +84,36 @@ SFTP_MANAGER_CHROOT_DIR="${SFTP_BASE_DIR}" # 管理用户的 chroot 目录是 /d
 # 稍微聚合了相关操作。内部逻辑已尽量扁平化。
 #
 # 参数:
-#   $1: 用户名:密码 字符串 (e.g., "username:password")
+#   $1: 用户配置字符串 (e.g., "username:password:e:uid:gid:dir1,dir2")
 #
 # -----------------------------------------------------------------------------
 function create_sftp_user_with_chroot() {
-    local user_pass_pair="$1"
-    local username=$(echo "$user_pass_pair" | cut -d':' -f1)
-    local password=$(echo "$user_pass_pair" | cut -d':' -f2-) # 密码可能包含冒号
+    local entry="$1"
+    log "正在解析用户信息: \"$entry\""
+
+    # 使用数组解析冒号分隔的参数
+    IFS=':' read -ra args <<< "$entry"
+    
+    local username="${args[0]}"
+    local password="${args[1]}"
+    local chpasswd_opts=""
+    local skip_idx=0
+
+    # 验证用户名
+    if [[ ! "$username" =~ ^$reUser$ ]]; then
+        log "错误: 无效的用户名 \"$username\""
+        return 1
+    fi
+
+    # 检查是否为加密密码 (标志位 'e')
+    if [ "${args[2]}" == "e" ]; then
+        chpasswd_opts="-e"
+        skip_idx=1
+    fi
+
+    local uid="${args[$((skip_idx+2))]}"
+    local gid="${args[$((skip_idx+3))]}"
+    local dirs="${args[$((skip_idx+4))]}"
 
     log "正在处理用户: $username"
 
@@ -93,77 +121,85 @@ function create_sftp_user_with_chroot() {
     # -------------------------------------------------------------------------
     local user_chroot_dir=""
     if [[ "$username" == "$SFTP_MANAGER_USER" ]]; then
-        user_chroot_dir="$SFTP_MANAGER_CHROOT_DIR" # 管理用户的 chroot 目录是 /data
-        log "用户 $username 是管理用户，其 chroot 目录设置为: $user_chroot_dir"
+        user_chroot_dir="$SFTP_MANAGER_CHROOT_DIR"
+        log "用户 $username 是管理用户，其 chroot 目录为: $user_chroot_dir"
     else
-        # 其他用户的 chroot 目录是 /data/<username>
         user_chroot_dir="${SFTP_BASE_DIR}/${username}"
-        log "用户 $username 的 chroot 目录设置为: $user_chroot_dir"
+        log "用户 $username 的 chroot 目录为: $user_chroot_dir"
     fi
 
     # --- 2. 创建用户和用户组 ---
-    # 确保 'users' 组存在。
     # -------------------------------------------------------------------------
-    if ! getent group users > /dev/null; then
-        groupadd users
-        log "创建用户组: users"
+    local useradd_opts=(--no-user-group --badname -M -d "$user_chroot_dir" -s /sbin/nologin)
+    
+    # 处理自定义 UID/GID
+    if [ -n "$uid" ]; then
+        useradd_opts+=(--non-unique --uid "$uid")
     fi
 
-    # 创建用户，并将其添加到 'users' 组。
-    # 使用 -d 明确指定家目录，这对于 sshd 的 ChrootDirectory %h 行为至关重要。
-    # 使用 -M 不创建默认家目录，因为我们手动管理。
-    # 使用 -s /sbin/nologin 禁用 shell 登录。
-    # -------------------------------------------------------------------------
-    if ! id -u "$username" > /dev/null 2>&1; then
-        useradd -M -g users -d "$user_chroot_dir" -s /sbin/nologin "$username"
-        log "创建用户: $username，家目录 (chroot 目录): $user_chroot_dir"
+    if [ -n "$gid" ]; then
+        if ! getent group "$gid" > /dev/null; then
+            groupadd --gid "$gid" "group_$gid"
+            log "创建用户组: group_$gid (GID: $gid)"
+        fi
+        useradd_opts+=(--gid "$gid")
     else
-        log "用户 $username 已存在，跳过创建。确保其家目录为 $user_chroot_dir。"
-        # 如果用户已存在，更新其家目录以匹配我们的 chroot 结构
-        usermod -d "$user_chroot_dir" "$username"
+        # 默认使用 users 组
+        if ! getent group users > /dev/null; then
+            groupadd users
+        fi
+        useradd_opts+=(--gid users)
     fi
 
-    # 设置用户密码。如果未提供密码，则禁用密码登录（支持密钥登录）。
-    # -------------------------------------------------------------------------
+    if ! id -u "$username" > /dev/null 2>&1; then
+        useradd "${useradd_opts[@]}" "$username"
+        log "创建用户: $username (家目录: $user_chroot_dir)"
+    else
+        log "用户 $username 已存在，更新设置。"
+        usermod -d "$user_chroot_dir" "$username"
+        if [ -n "$gid" ]; then usermod -g "$gid" "$username"; fi
+    fi
+
+    # 设置密码
     if [ -n "$password" ]; then
-        echo "$username:$password" | chpasswd
-        log "设置用户 $username 的密码。"
+        echo "$username:$password" | chpasswd $chpasswd_opts
+        log "已设置用户 $username 的密码 (选项: ${chpasswd_opts:-无})。"
     else
         usermod -p "*" "$username"
-        log "用户 $username 未提供密码，已禁用密码登录（仅支持密钥登录）。"
+        log "用户 $username 未通过参数设置密码。"
     fi
+    
+    # 记录真实 UID，用于权限设置
+    local real_uid=$(id -u "$username")
 
     # --- 3. 设置 chroot 目录结构和权限 ---
-    #
-    # 哥，这里是 SFTP chroot 的核心权限要求：
-    # ChrootDirectory 指定的目录及其所有父目录，直到文件系统的根目录，
-    # 都必须由 root 拥有，且不能被其他用户或组写入。
-    # -------------------------------------------------------------------------
-
-    # 确保 /data 目录由 root 拥有，且权限严格。
-    # 这是所有用户 chroot 路径的共同父目录。
     # -------------------------------------------------------------------------
     mkdir -p "$SFTP_BASE_DIR"
     chown root:root "$SFTP_BASE_DIR"
-    chmod 755 "$SFTP_BASE_DIR" # root 拥有，其他用户可读可执行
-    log "设置 SFTP 基目录 $SFTP_BASE_DIR 权限为 root:root 755。"
+    chmod 755 "$SFTP_BASE_DIR"
 
-    # 创建用户的实际 chroot 目录。
-    # **重要：这个目录本身必须由 root 拥有，且不能被其他用户或组写入。**
-    # -------------------------------------------------------------------------
     mkdir -p "$user_chroot_dir"
-    chown root:root "$user_chroot_dir" # <--- 修改点1: chroot 目录本身由 root 拥有
-    chmod 755 "$user_chroot_dir"       # <--- 修改点2: chroot 目录权限为 755 (root可写，其他可读可执行)
-    log "设置用户 $username 的 chroot 目录 $user_chroot_dir 权限为 root:root 755。"
+    chown root:root "$user_chroot_dir"
+    chmod 755 "$user_chroot_dir"
 
-    # 在 chroot 目录内部创建一个用户可写的子目录。
-    # 用户将在这个子目录中进行文件上传和管理。
-    # -------------------------------------------------------------------------
-    local user_writable_dir="${user_chroot_dir}/upload" # 默认创建 'upload' 目录
-    mkdir -p "$user_writable_dir"
-    chown "$username":users "$user_writable_dir"
-    chmod 775 "$user_writable_dir" # 用户和组可读写，其他用户只读
-    log "在用户 $username 的 chroot 目录 $user_chroot_dir 内创建可写子目录 $user_writable_dir，权限为 $username:users 775。"
+    # 处理自定义子目录
+    if [ -n "$dirs" ]; then
+        IFS=',' read -ra dir_list <<< "$dirs"
+        for d in "${dir_list[@]}"; do
+            local d_path="${user_chroot_dir}/$d"
+            mkdir -p "$d_path"
+            chown "$real_uid" "$d_path"
+            chmod 775 "$d_path"
+            log "创建子目录: $d_path (所有者 UID: $real_uid)"
+        done
+    else
+        # 默认创建 upload 目录
+        local d_path="${user_chroot_dir}/upload"
+        mkdir -p "$d_path"
+        chown "$real_uid" "$d_path"
+        chmod 775 "$d_path"
+        log "创建默认子目录: $d_path"
+    fi
 
 
     # --- 4. 设置 SSH 密钥 (免密登录支持) ---
@@ -206,21 +242,28 @@ function create_sftp_user_with_chroot() {
     # --- 5. 设置管理用户对其他用户 chroot 目录的读写权限 ---
     # -------------------------------------------------------------------------
     if [[ -n "$SFTP_MANAGER_USER" && "$username" != "$SFTP_MANAGER_USER" ]]; then
-        # 对于非管理用户，确保管理用户对其 chroot 目录的 *可写子目录* 有读写权限。
-        # 这里使用 ACL (Access Control List) 来实现，因为它比修改组权限更精确和安全。
+        # 对于非管理用户，确保管理用户对其 chroot 目录的 *所有子目录* 有读写权限。
         # ---------------------------------------------------------------------
         if command -v setfacl >/dev/null 2>&1; then
-            # 为管理用户设置对当前用户可写目录的 rwx 权限
-            setfacl -m u:"$SFTP_MANAGER_USER":rwx "$user_writable_dir"
-            setfacl -m d:u:"$SFTP_MANAGER_USER":rwx "$user_writable_dir" # 设置默认 ACL，新文件继承
-            log "为管理用户 $SFTP_MANAGER_USER 设置 ACL 权限到 $user_writable_dir。"
+            # 找到所有非 .sh 和非只读文件的子目录进行权限设置
+            # 这里简单处理：对所有用户创建的子目录设置 ACL
+            local target_dirs=()
+            if [ -n "$dirs" ]; then
+                IFS=',' read -ra dir_list <<< "$dirs"
+                for d in "${dir_list[@]}"; do target_dirs+=("${user_chroot_dir}/$d"); done
+            else
+                target_dirs+=("${user_chroot_dir}/upload")
+            fi
+
+            for td in "${target_dirs[@]}"; do
+                if [ -d "$td" ]; then
+                    setfacl -m u:"$SFTP_MANAGER_USER":rwx "$td"
+                    setfacl -m d:u:"$SFTP_MANAGER_USER":rwx "$td"
+                    log "为管理用户 $SFTP_MANAGER_USER 设置 ACL 权限到 $td。"
+                fi
+            done
         else
             log "警告: setfacl 命令不可用。无法为管理用户 $SFTP_MANAGER_USER 设置精确的 ACL 权限。"
-            log "请考虑安装 acl 包 (e.g., apt-get install acl 或 yum install acl)。"
-            # 如果没有 ACL，备用方案是将管理用户也加入 users 组，
-            # 并将 chroot 目录的组权限设置为可写。但这会降低安全性。
-            # chown "$username":users "$user_chroot_dir"
-            # chmod 775 "$user_chroot_dir" # 组可写，管理用户也在 users 组
         fi
     fi
 
